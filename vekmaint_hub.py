@@ -11,7 +11,8 @@ Arquitectura:
 2. 🚨 Reporte de Fallas             → genera OT-CO-* (operación)
 3. 📅 Mantenimiento Preventivo      → genera OT-P-<SIST>-<VEH>-...
 4. 📋 Cierre de OT                  → cierra todas las OT (CI, CO, P, M)
-5. 📊 Dashboard KPI & Analítica     → (próximamente) hoja de vida consolidada
+5. 📊 Dashboard KPI & Analítica     → KPIs (disponibilidad, CPK, no despachados),
+                                      Pareto de fallas, hoja de vida exportable.
 """
 import streamlit as st
 import json
@@ -33,7 +34,7 @@ FLOTA_DB      = "flota_vehiculos.json"
 INSP_XLSX     = "inspecciones_vehiculares.xlsx"
 MANT_XLSX     = "mantenimiento_flotas.xlsx"
 
-VALID_MODULES = {"hub", "inspeccion", "reporte_fallas", "preventivo", "cierre_ot"}
+VALID_MODULES = {"hub", "inspeccion", "reporte_fallas", "preventivo", "cierre_ot", "analitica", "gestion_flota"}
 
 
 def _sync_state_with_url():
@@ -73,6 +74,8 @@ def _navigate(mod: str, clear_module_state: bool = True):
             # preventivo
             "prev_tab", "prev_vehiculo_sel", "prev_rutinas_sel",
             "prev_form_data", "prev_confirmacion", "prev_ot_generada",
+            # gestión de flota
+            "flota_editando", "flota_tab", "flt_marca", "flt_tipo", "flt_estado", "flt_buscar",
         ]
         for k in claves_limpiar:
             st.session_state.pop(k, None)
@@ -137,65 +140,25 @@ def count_vehiculos_flota() -> int:
 def evaluar_rutinas_flota():
     """
     Evalúa el estado de todas las rutinas de toda la flota.
+    DELEGA al módulo de mantenimiento_preventivo para garantizar que la lógica
+    sea idéntica (incluyendo la inferencia automática de última ejecución teórica
+    cuando no hay registro previo).
+
     Retorna lista de dicts con: vehiculo, km_actual, rutina_id, rutina_nombre,
                                 sistema, estado, km_restantes, dias_restantes, pct_consumido.
-
-    Estados (alineado con módulo preventivo):
-    • vencida:  ≥ 100% del periodo (km o días)
-    • critico:  ≥ 95%
-    • proxima:  ≥ 80%
-    • vigente:  < 80%
     """
-    from datetime import date
-    resultados = []
     try:
         if not os.path.exists(FLOTA_DB):
-            return resultados
-        with open(FLOTA_DB, encoding="utf-8") as f:
-            flota = json.load(f)
+            return []
         if not os.path.exists("catalogo_rutinas.json"):
-            return resultados
-        with open("catalogo_rutinas.json", encoding="utf-8") as f:
-            catalogo = json.load(f)
-
-        hoy = date.today()
-        for veh_id, vdata in flota.items():
-            km_actual = vdata.get("km_actual", 0)
-            ultimas = vdata.get("rutinas_ultimas", {})
-            for rut in catalogo:
-                ult = ultimas.get(rut["id"], {})
-                if not ult:
-                    estado, km_rest, dias_rest, pct = "nunca_ejecutada", 0, 0, 0.0
-                else:
-                    try:
-                        fecha_ult = datetime.strptime(ult.get("fecha", ""), "%Y-%m-%d").date()
-                    except Exception:
-                        continue
-                    km_transc   = max(0, km_actual - ult.get("km", 0))
-                    dias_transc = (hoy - fecha_ult).days
-                    km_rest   = rut["periodicidad_km"] - km_transc
-                    dias_rest = rut["periodicidad_dias"] - dias_transc
-                    pct_km   = km_transc / rut["periodicidad_km"] if rut["periodicidad_km"] > 0 else 0
-                    pct_dias = dias_transc / rut["periodicidad_dias"] if rut["periodicidad_dias"] > 0 else 0
-                    pct = max(pct_km, pct_dias)
-                    if pct >= 1.0:    estado = "vencida"
-                    elif pct >= 0.95: estado = "critico"
-                    elif pct >= 0.80: estado = "proxima"
-                    else:             estado = "vigente"
-                resultados.append({
-                    "vehiculo":       veh_id,
-                    "km_actual":      km_actual,
-                    "rutina_id":      rut["id"],
-                    "rutina_nombre":  rut["nombre"],
-                    "sistema":        rut["sistema"],
-                    "estado":         estado,
-                    "km_restantes":   km_rest,
-                    "dias_restantes": dias_rest,
-                    "pct_consumido":  pct,
-                })
+            return []
+        # Importación local para evitar dependencias circulares al cargar el módulo
+        import mantenimiento_preventivo as _mp
+        flota = _mp._cargar_flota()
+        catalogo = _mp._cargar_catalogo()
+        return _mp._evaluar_flota_completa(flota, catalogo)
     except Exception:
-        pass
-    return resultados
+        return []
 
 
 def count_rutinas_por_estado():
@@ -241,6 +204,201 @@ def preventivos_programados_hoy():
     return programados
 
 
+def vehiculos_fuera_de_servicio():
+    """
+    Retorna la lista de vehículos que están fuera de servicio por mantenimientos
+    correctivos pendientes. Un vehículo se considera fuera de servicio si tiene
+    al menos una OT-CI (correctivo de inspección) o OT-CO (correctivo de operación)
+    que NO ha sido cerrada.
+
+    NO incluye OT-P (preventivos programados) ni OT-M (mayor) en el conteo,
+    porque las preventivas no necesariamente sacan al vehículo de operación
+    inmediatamente.
+
+    Retorna lista de dicts: [{vehiculo, ots: [ot1, ot2], sistemas: [s1, s2], dias_inactivo}]
+    """
+    from datetime import date
+    if not os.path.exists(PENDIENTES_DB):
+        return []
+    try:
+        with open(PENDIENTES_DB, encoding="utf-8") as f:
+            db = json.load(f)
+    except Exception:
+        return []
+
+    # Agrupar OTs correctivas pendientes por vehículo
+    por_vehiculo = {}
+    hoy = date.today()
+    for ot, datos in db.items():
+        # Solo correctivos: OT-CI (de inspección) y OT-CO (de operación)
+        if not (ot.startswith("OT-CI-") or ot.startswith("OT-CO-")):
+            continue
+        veh = datos.get("Numero_Interno", "").strip()
+        if not veh:
+            continue
+        if veh not in por_vehiculo:
+            por_vehiculo[veh] = {"vehiculo": veh, "ots": [], "sistemas": set(),
+                                   "fecha_min": None}
+        por_vehiculo[veh]["ots"].append(ot)
+        sis = datos.get("Sistema", "")
+        if sis:
+            por_vehiculo[veh]["sistemas"].add(sis)
+        # Fecha de inicio de inactividad (más antigua entre las OTs del vehículo)
+        fi_str = datos.get("Fecha_Inicio_Inactividad", "") or datos.get("Fecha_Registro_F1", "")
+        try:
+            fi = datetime.strptime(fi_str.split(" ")[0], "%Y-%m-%d").date()
+            cur = por_vehiculo[veh]["fecha_min"]
+            if cur is None or fi < cur:
+                por_vehiculo[veh]["fecha_min"] = fi
+        except Exception:
+            pass
+
+    # Convertir a lista con dias_inactivo
+    resultado = []
+    for veh, info in por_vehiculo.items():
+        dias = (hoy - info["fecha_min"]).days if info["fecha_min"] else 0
+        resultado.append({
+            "vehiculo":      veh,
+            "ots":           info["ots"],
+            "sistemas":      sorted(info["sistemas"]),
+            "n_ots":         len(info["ots"]),
+            "dias_inactivo": max(0, dias),
+        })
+    # Ordenar por días inactivo descendente (más urgente primero)
+    resultado.sort(key=lambda x: -x["dias_inactivo"])
+    return resultado
+
+
+def cumplimiento_preventivo_mes(margen_anticipo_dias=5, margen_retraso_dias=2):
+    """
+    Calcula el % de cumplimiento del plan de mantenimiento preventivo del MES VIGENTE
+    (mes calendario en curso), según la lógica:
+
+        cumplimiento = OT-P cerradas a tiempo / OT-P programadas en el mes
+
+    "A tiempo" significa que la fecha de cierre está dentro de la ventana:
+        [fecha_programada - margen_anticipo_dias, fecha_programada + margen_retraso_dias]
+
+    Por defecto: hasta 5 días antes o hasta 2 días después de la fecha programada.
+
+    Solo considera OT-P (preventivas). Ignora correctivos y mayores.
+    Si no hay OT-P programadas en el mes, retorna None (no aplicable).
+
+    El cálculo por mes calendario permite:
+    - Reportar mensualmente con frecuencia natural del negocio
+    - Comparar mes contra mes mismo año (tendencia interanual)
+    - Comparar mes mismo periodo año anterior (estacionalidad)
+
+    Retorna dict: {pct, programadas, cumplidas, sin_cumplir, sin_ejecutar,
+                   nombre_mes, ano, dia_actual_mes, dias_totales_mes}
+    """
+    from datetime import date, timedelta
+    import calendar
+    hoy = date.today()
+    # Inicio del mes vigente (día 1)
+    inicio_mes = date(hoy.year, hoy.month, 1)
+    # Último día del mes vigente
+    ultimo_dia = calendar.monthrange(hoy.year, hoy.month)[1]
+    fin_mes = date(hoy.year, hoy.month, ultimo_dia)
+    # La ventana de evaluación es TODO el mes calendario
+    inicio_ventana = inicio_mes
+    fin_ventana = fin_mes
+
+    # 1. OT-P programadas dentro del periodo (últimos 30 días)
+    # Vienen del archivo histórico (mantenimiento_flotas.xlsx) y de pendientes
+    programadas = []  # lista de {ot, fecha_prog, fecha_cierre}
+
+    # Pendientes (no cerradas) — programadas pero no ejecutadas aún
+    if os.path.exists(PENDIENTES_DB):
+        try:
+            with open(PENDIENTES_DB, encoding="utf-8") as f:
+                db_pend = json.load(f)
+            for ot, datos in db_pend.items():
+                if not ot.startswith("OT-P-"):
+                    continue
+                fp_str = datos.get("Fecha_Programada", "")
+                try:
+                    fp = datetime.strptime(fp_str.split(" ")[0], "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                if inicio_ventana <= fp <= fin_ventana:
+                    programadas.append({"ot": ot, "fecha_prog": fp, "fecha_cierre": None})
+        except Exception:
+            pass
+
+    # Cerradas — leer histórico XLSX
+    historico_xlsx = "mantenimiento_flotas.xlsx"
+    if os.path.exists(historico_xlsx):
+        try:
+            import pandas as pd
+            df = pd.read_excel(historico_xlsx)
+            # Filtrar OT-P
+            df_p = df[df.get("OT", "").astype(str).str.startswith("OT-P-")] if "OT" in df.columns else df.iloc[0:0]
+            for _, row in df_p.iterrows():
+                ot = str(row.get("OT", ""))
+                fp_str = str(row.get("Fecha_Programada", ""))
+                fc_str = str(row.get("Fecha_Cierre", "")) or str(row.get("Fecha_Fin_Mantenimiento", ""))
+                try:
+                    fp = datetime.strptime(fp_str.split(" ")[0], "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                if not (inicio_ventana <= fp <= fin_ventana):
+                    continue
+                fc = None
+                try:
+                    fc = datetime.strptime(fc_str.split(" ")[0], "%Y-%m-%d").date()
+                except Exception:
+                    pass
+                programadas.append({"ot": ot, "fecha_prog": fp, "fecha_cierre": fc})
+        except Exception:
+            pass
+
+    n_prog = len(programadas)
+    if n_prog == 0:
+        return None  # No hay datos para calcular
+
+    # 2. Clasificar cada programación
+    cumplidas    = 0
+    sin_cumplir  = 0  # ejecutada fuera de la ventana
+    sin_ejecutar = 0  # programada pero aún no cerrada
+    for p in programadas:
+        if p["fecha_cierre"] is None:
+            # Si ya pasó la ventana de retraso permitido, ya no puede cumplir
+            if hoy > p["fecha_prog"] + timedelta(days=margen_retraso_dias):
+                sin_cumplir += 1
+            else:
+                sin_ejecutar += 1
+            continue
+        delta = (p["fecha_cierre"] - p["fecha_prog"]).days
+        if -margen_anticipo_dias <= delta <= margen_retraso_dias:
+            cumplidas += 1
+        else:
+            sin_cumplir += 1
+
+    # 3. Calcular pct
+    # Las "sin_ejecutar" todavía pueden cumplirse; se cuentan como "en proceso"
+    # pero NO como cumplidas todavía. El denominador son todas las programadas.
+    base = cumplidas + sin_cumplir + sin_ejecutar
+    pct = round((cumplidas / base) * 100) if base > 0 else 0
+
+    meses_es = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+                "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+    return {
+        "pct":              pct,
+        "programadas":      n_prog,
+        "cumplidas":        cumplidas,
+        "sin_cumplir":      sin_cumplir,
+        "sin_ejecutar":     sin_ejecutar,
+        "nombre_mes":       meses_es[hoy.month],
+        "ano":              hoy.year,
+        "dia_actual_mes":   hoy.day,
+        "dias_totales_mes": ultimo_dia,
+        "margen_anticipo":  margen_anticipo_dias,
+        "margen_retraso":   margen_retraso_dias,
+    }
+
+
 # ════════════════════════════════════════════════════════════
 #  DISPATCH — si hay un módulo activo, ejecutarlo y salir
 # ════════════════════════════════════════════════════════════
@@ -280,6 +438,26 @@ if modulo_actual == "cierre_ot":
         cierre_ot.run()
     except ImportError as e:
         st.error(f"No se encontró `cierre_ot.py` ({e}). Verifica que esté en la misma carpeta.")
+        if st.button("← Volver al Hub"):
+            _navigate("hub")
+    st.stop()
+
+if modulo_actual == "analitica":
+    try:
+        import dashboard_analitica
+        dashboard_analitica.run()
+    except ImportError as e:
+        st.error(f"No se encontró `dashboard_analitica.py` ({e}). Verifica que esté en la misma carpeta.")
+        if st.button("← Volver al Hub"):
+            _navigate("hub")
+    st.stop()
+
+if modulo_actual == "gestion_flota":
+    try:
+        import gestion_flota
+        gestion_flota.run()
+    except ImportError as e:
+        st.error(f"No se encontró `gestion_flota.py` ({e}). Verifica que esté en la misma carpeta.")
         if st.button("← Volver al Hub"):
             _navigate("hub")
     st.stop()
@@ -335,6 +513,20 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;colo
 [data-testid="stButton"] button:hover{color:var(--text)!important;border-color:var(--text)!important;background:var(--surface2)!important;transform:none!important;box-shadow:none!important}
 .btn-exit button{color:#F85149!important;border-color:rgba(248,81,73,.3)!important}
 .btn-exit button:hover{background:rgba(248,81,73,.1)!important;border-color:#F85149!important;color:#F85149!important}
+/* Botón "Gestión de Flota" del header — discreto pero distintivo en color Vekmaint.
+   Usamos un marcador hermano anterior (mismo patrón que en el módulo preventivo) */
+.btn-flota-marker{display:none}
+[data-testid="stElementContainer"]:has(.btn-flota-marker) + [data-testid="stElementContainer"] button {
+  background:rgba(255,107,0,.08)!important;
+  color:var(--orange)!important;
+  border-color:rgba(255,107,0,.35)!important;
+  font-weight:600!important;
+}
+[data-testid="stElementContainer"]:has(.btn-flota-marker) + [data-testid="stElementContainer"] button:hover {
+  background:rgba(255,107,0,.18)!important;
+  border-color:var(--orange)!important;
+  color:var(--accent-lt,#FFD8B8)!important;
+}
 .hub-divider{border:none;border-top:1px solid var(--border);margin:1.5rem 0}
 .hub-footer{text-align:center;font-size:.72rem;color:var(--muted);padding:1rem 0 .5rem;border-top:1px solid var(--border);margin-top:2rem}
 .integration-note{background:rgba(255,107,0,.06);border:1px solid rgba(255,107,0,.2);border-radius:10px;padding:.7rem 1rem;font-size:.78rem;color:#FF9A40;margin:.3rem 0 1rem 0}
@@ -372,123 +564,95 @@ n_vencidas = counts_rutinas["vencida"]
 n_criticas = counts_rutinas["critico"]
 n_proximas = counts_rutinas["proxima"]
 preventivos_hoy = preventivos_programados_hoy()
+
+# ── NUEVOS INDICADORES ──
+vehiculos_fs = vehiculos_fuera_de_servicio()
+n_fuera_servicio = len(vehiculos_fs)
+cumplimiento = cumplimiento_preventivo_mes()  # None si no hay datos
+
 hora_str   = datetime.now().strftime("%H:%M")
 fecha_str  = datetime.now().strftime("%A, %d de %B de %Y")
 
-st.markdown(f"""
-<div class="hub-header">
-  <div class="hub-logo">🔧</div>
-  <div class="hub-brand">
-    <h1>Vekmaint Solutions</h1>
-    <span class="tagline">Vehicle Knowledge for Maintenance Solutions</span>
-  </div>
-  <div class="hub-date"><strong>{hora_str}</strong><br>{fecha_str}</div>
-</div>
-""", unsafe_allow_html=True)
+# Header con botón de Gestión de Flota a la derecha (acceso administrativo discreto)
+hcol_brand, hcol_actions = st.columns([5, 2])
+
+with hcol_brand:
+    st.markdown(f"""
+    <div class="hub-header" style="border-bottom:none;padding-bottom:.4rem">
+      <div class="hub-logo">🔧</div>
+      <div class="hub-brand">
+        <h1>Vekmaint Solutions</h1>
+        <span class="tagline">Vehicle Knowledge for Maintenance Solutions</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with hcol_actions:
+    # Fecha/hora discretas arriba del botón
+    st.markdown(f"""<div style="text-align:right;font-size:.75rem;color:var(--muted);
+       line-height:1.4;padding-top:1.4rem;margin-bottom:.4rem">
+      <strong style="color:var(--text);font-weight:600">{hora_str}</strong><br>
+      {fecha_str}
+    </div>""", unsafe_allow_html=True)
+    # Marcador invisible para que el CSS pinte el botón siguiente con color Vekmaint
+    st.markdown('<span class="btn-flota-marker"></span>', unsafe_allow_html=True)
+    if st.button("🚛  Gestión de Flota", key="btn_gestion_flota_header",
+                    use_container_width=True,
+                    help="Administra el inventario maestro de vehículos: registrar, editar, importar"):
+        _navigate("gestion_flota")
+
+# Línea separadora sutil
+st.markdown('<div style="border-bottom:1px solid var(--border);margin:.2rem 0 1rem 0"></div>',
+              unsafe_allow_html=True)
 
 # ── Stats bar ───────────────────────────────────
 dot_pend = "var(--orange)" if n_pend > 0 else "var(--green)"
+dot_fs   = "var(--red)" if n_fuera_servicio > 0 else "var(--green)"
 dot_venc = "var(--red)" if n_vencidas > 0 else ("var(--orange)" if n_criticas > 0 else "var(--green)")
+
+# Chip de cumplimiento del preventivo (mes vigente)
+if cumplimiento is None:
+    chip_cumpl = """<div class="stat-chip"><span class="dot" style="background:var(--muted)"></span>
+      Cumplimiento Preventivo: <strong>—</strong>
+      <span style="color:var(--muted);font-size:.7rem;margin-left:.3rem">(sin OT-P programadas este mes)</span></div>"""
+else:
+    if cumplimiento['pct'] >= 85:    color_c = "var(--green)"
+    elif cumplimiento['pct'] >= 60:  color_c = "var(--orange)"
+    else:                             color_c = "var(--red)"
+    mes_corto = cumplimiento['nombre_mes'][:3]
+    chip_cumpl = f"""<div class="stat-chip"><span class="dot" style="background:{color_c}"></span>
+      Cumplimiento Preventivo {mes_corto}: <strong>{cumplimiento['pct']}%</strong>
+      <span style="color:var(--muted);font-size:.7rem;margin-left:.3rem">
+        ({cumplimiento['cumplidas']}/{cumplimiento['programadas']} OT-P · día {cumplimiento['dia_actual_mes']}/{cumplimiento['dias_totales_mes']})
+      </span></div>"""
+
 st.markdown(f"""
 <div class="stats-bar">
-  <div class="stat-chip"><span class="dot" style="background:{dot_pend}"></span>
-    <strong>{n_pend}</strong> OT{'s' if n_pend!=1 else ''} pendiente{'s' if n_pend!=1 else ''}</div>
-  <div class="stat-chip"><span class="dot" style="background:var(--blue)"></span>
-    <strong>{n_hoy}</strong> inspección{'es' if n_hoy!=1 else ''} hoy</div>
+  <div class="stat-chip"><span class="dot" style="background:{dot_fs}"></span>
+    <strong>{n_fuera_servicio}</strong> vehículo{'s' if n_fuera_servicio!=1 else ''} fuera de servicio
+    <span style="color:var(--muted);font-size:.7rem;margin-left:.3rem">(correctivos abiertos)</span></div>
   <div class="stat-chip"><span class="dot" style="background:var(--purple)"></span>
     <strong>{n_flota}</strong> vehículo{'s' if n_flota!=1 else ''} en flota</div>
+  <div class="stat-chip"><span class="dot" style="background:var(--blue)"></span>
+    <strong>{n_hoy}</strong> inspección{'es' if n_hoy!=1 else ''} hoy</div>
+  <div class="stat-chip"><span class="dot" style="background:{dot_pend}"></span>
+    <strong>{n_pend}</strong> OT{'s' if n_pend!=1 else ''} pendiente{'s' if n_pend!=1 else ''} de cierre</div>
   <div class="stat-chip"><span class="dot" style="background:{dot_venc}"></span>
-    <strong>{n_vencidas}</strong> vencida{'s' if n_vencidas!=1 else ''} ·
-    <strong>{n_criticas}</strong> crítica{'s' if n_criticas!=1 else ''} ·
-    <strong>{n_proximas}</strong> próxima{'s' if n_proximas!=1 else ''}</div>
+    Rutinas preventivas: <strong>{n_vencidas}</strong> vencidas ·
+    <strong>{n_criticas}</strong> críticas ·
+    <strong>{n_proximas}</strong> próximas</div>
+  {chip_cumpl}
 </div>
 """, unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════
-#  BANNER 1 — Preventivos programados HOY
-# ════════════════════════════════════════════════════
-if preventivos_hoy:
-    items_hoy_html = ""
-    for p in preventivos_hoy[:5]:
-        items_hoy_html += f"""<span class="alert-chip-purple">
-          🚛 {p['vehiculo']} · {p['sistema']}{(' · ' + p['hora']) if p['hora'] else ''}
-        </span>"""
-    extra = f" · +{len(preventivos_hoy) - 5} más" if len(preventivos_hoy) > 5 else ""
-    st.markdown(f"""<div class="alert-banner alert-purple">
-      <div class="alert-banner-title">📅 Preventivos programados para HOY ({len(preventivos_hoy)})</div>
-      <div class="alert-banner-content">
-        {items_hoy_html}
-        <span style="font-size:.75rem;color:var(--muted);margin-left:.4rem">{extra}</span>
-      </div>
-      <div style="font-size:.75rem;color:var(--muted);margin-top:.4rem">
-        Estos vehículos requieren atención del taller hoy. Acceda a <strong style="color:var(--text)">Cierre de OT</strong> para completar la intervención.
-      </div>
-    </div>""", unsafe_allow_html=True)
+# Los banners de alertas (vehículos fuera de servicio, preventivos hoy, vencidas,
+# próximas a vencer) se eliminaron del Hub para mantener los módulos visibles
+# sin necesidad de hacer scroll. La información sigue disponible:
+#   · Vehículos fuera de servicio → chip de stats + módulo "Cierre de OT"
+#   · Preventivos programados hoy → módulo "Mantenimiento Preventivo" → Calendario
+#   · Rutinas vencidas / críticas / próximas → chip de stats + módulo Preventivo
+# Los chips de la stats-bar siguen mostrando los conteos para alertar al usuario.
 
-# ════════════════════════════════════════════════════
-#  BANNER 2 — Rutinas VENCIDAS (crítico operativo)
-# ════════════════════════════════════════════════════
-rutinas_vencidas = sorted(
-    [r for r in rutinas_evaluadas if r["estado"] == "vencida"],
-    key=lambda x: -x["pct_consumido"]
-)
-if rutinas_vencidas:
-    items_html = ""
-    for r in rutinas_vencidas[:5]:
-        km_exc = abs(r["km_restantes"]) if r["km_restantes"] < 0 else 0
-        info_extra = f" · {km_exc:,} km excedidos".replace(",", ".") if km_exc > 0 else ""
-        items_html += f"""<div class="alert-row-red">
-          <div><strong style="color:var(--text)">Vehículo {r['vehiculo']}</strong> · {r['rutina_nombre']}{info_extra}</div>
-          <div style="font-size:.75rem;color:var(--muted)">{r['rutina_id']} · Sistema: {r['sistema']}</div>
-        </div>"""
-    extra = f"<div style='font-size:.78rem;color:var(--muted);margin-top:.3rem'>+ {len(rutinas_vencidas) - 5} rutinas vencidas adicionales</div>" if len(rutinas_vencidas) > 5 else ""
-    st.markdown(f"""<div class="alert-banner alert-red">
-      <div class="alert-banner-title">🔴 {len(rutinas_vencidas)} rutina{'s' if len(rutinas_vencidas)!=1 else ''} vencida{'s' if len(rutinas_vencidas)!=1 else ''} — Acción inmediata requerida</div>
-      <div class="alert-banner-content">
-        {items_html}
-        {extra}
-      </div>
-    </div>""", unsafe_allow_html=True)
-
-# ════════════════════════════════════════════════════
-#  BANNER 3 — Rutinas PRÓXIMAS A VENCER (críticas + próximas)
-# ════════════════════════════════════════════════════
-rutinas_advert = sorted(
-    [r for r in rutinas_evaluadas if r["estado"] in ("critico", "proxima")],
-    key=lambda x: -x["pct_consumido"]
-)
-if rutinas_advert:
-    items_html = ""
-    for r in rutinas_advert[:5]:
-        chip = "🟠" if r["estado"] == "critico" else "🟡"
-        pct = r["pct_consumido"] * 100
-        items_html += f"""<div class="alert-row-yellow">
-          <div>{chip} <strong style="color:var(--text)">Vehículo {r['vehiculo']}</strong> · {r['rutina_nombre']}</div>
-          <div style="font-size:.75rem;color:var(--muted)">{r['rutina_id']} · {pct:.0f}% consumido · {r['km_restantes']:,} km restantes</div>
-        </div>""".replace(",", ".")
-    extra = f"<div style='font-size:.78rem;color:var(--muted);margin-top:.3rem'>+ {len(rutinas_advert) - 5} rutinas adicionales próximas a vencer</div>" if len(rutinas_advert) > 5 else ""
-    st.markdown(f"""<div class="alert-banner alert-yellow">
-      <div class="alert-banner-title">🟠 {n_criticas} crítica{'s' if n_criticas!=1 else ''} · 🟡 {n_proximas} próxima{'s' if n_proximas!=1 else ''} a vencer</div>
-      <div class="alert-banner-content">
-        {items_html}
-        {extra}
-      </div>
-      <div style="font-size:.75rem;color:var(--muted);margin-top:.4rem">
-        Planifique antes de que venzan en el módulo <strong style="color:var(--text)">Mantenimiento Preventivo</strong>.
-      </div>
-    </div>""", unsafe_allow_html=True)
-
-# Notificación de OTs pendientes
-if n_pend > 0:
-    desglose = []
-    if n_pend_ci: desglose.append(f"{n_pend_ci} de inspección")
-    if n_pend_co: desglose.append(f"{n_pend_co} de operación")
-    if n_pend_p:  desglose.append(f"{n_pend_p} preventiva{'s' if n_pend_p > 1 else ''}")
-    if n_pend_m:  desglose.append(f"{n_pend_m} mayor{'es' if n_pend_m > 1 else ''}")
-    st.markdown(f"""<div class="integration-note">
-      🔗 <strong>{n_pend} OT{' pendiente' if n_pend==1 else 's pendientes'} de cierre</strong>
-      ({' · '.join(desglose)}) — Acceda al módulo <strong>Cierre de OT</strong> para completarlas.
-    </div>""", unsafe_allow_html=True)
 
 # ── TARJETAS DE MÓDULOS (5 en layout 3+2) ──────────
 # Fila 1: tres módulos de captura
@@ -563,11 +727,12 @@ with col5:
     <div class="module-card gray">
       <div class="card-icon-circle gray">📊</div>
       <div class="card-title">Dashboard KPI &amp; Analítica</div>
-      <div class="card-desc">Hoja de vida consolidada del vehículo, Pareto de fallas,
-        MTBF, cumplimiento del plan preventivo, razón correctivo/preventivo, costos por km.</div>
-      <span class="card-badge badge-gray">Próximamente — integración Power BI</span>
+      <div class="card-desc">Disponibilidad de flota, CPK mensual y acumulado año,
+        Pareto de fallas y % de no despachados. Hoja de vida exportable a Power BI.</div>
+      <span class="card-badge badge-gray">Analítica operativa</span>
     </div>""", unsafe_allow_html=True)
-    st.button("→ Próximamente", key="btn_dash", use_container_width=True, disabled=True)
+    if st.button("→ Abrir Analítica", key="btn_dash", use_container_width=True):
+        _navigate("analitica")
 
 # ── Footer ────────────────────────────────────
 st.markdown("<div class='hub-divider'></div>", unsafe_allow_html=True)
