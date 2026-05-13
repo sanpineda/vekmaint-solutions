@@ -44,7 +44,7 @@ MODOS_FALLA_INSP = {
         "Fuga de freno de aire (escape de aire audible)",
     ],
     "Freno de parqueo": ["Freno de parqueo no retiene el vehículo"],
-    "Nivel de aceite motor": ["Nivel de aceite bajo", "Aceite con aspecto anormal"],
+    "Nivel de aceite motor": ["Nivel de aceite bajo", "Fuga visible de aceite", "Aceite con aspecto anormal"],
     "Nivel de refrigerante": [
         "Nivel bajo al revisar depósito",
         "Fuga visible de refrigerante",
